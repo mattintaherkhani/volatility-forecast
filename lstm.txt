@@ -1,0 +1,217 @@
+
+Author: mattin 
+
+import os
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import List, Tuple, Dict
+
+
+np.random.seed(123)
+
+
+import tensorflow as tf
+tf.random.set_seed(123)
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.preprocessing import StandardScaler
+
+# ---------------------------
+# Config
+# ---------------------------
+@dataclass
+class Config:
+    csv_path: str = "gas.csv"        
+    date_col: str = "Date"
+    price_col: str = "Price"
+    rv_window: int = 21              
+    annualize: bool = False          
+    seq_len: int = 60                
+    horizons: List[int] = None      
+    train_window: int = 500        
+    retrain_every: int = 5          
+    epochs: int = 40
+    batch_size: int = 64
+    lr: float = 1e-3
+    verbose_fit: int = 0            
+    val_split: float = 0.1
+
+    def __post_init__(self):
+        if self.horizons is None:
+            self.horizons = [1, 5, 20, 60]
+
+CFG = Config()
+
+# ---------------------------
+# Data utilities
+# ---------------------------
+def load_price_series(cfg: Config) -> pd.Series:
+    df = pd.read_csv(cfg.csv_path)
+    df[cfg.date_col] = pd.to_datetime(df[cfg.date_col])
+    df = df.sort_values(cfg.date_col).reset_index(drop=True)
+    price = df[cfg.price_col].astype(float)
+    price.index = df[cfg.date_col]
+    return price
+
+def compute_realized_vol(price: pd.Series, rv_window: int, annualize: bool) -> pd.Series:
+    # log returns
+    ret = np.log(price).diff()
+    # rolling std of returns as volatility
+    vol = ret.rolling(rv_window).std()
+    if annualize:
+        vol = vol * np.sqrt(252)
+    vol = vol.dropna()
+    return vol
+
+
+def make_sequences(series: np.ndarray, end_indices: np.ndarray,
+                   seq_len: int, horizons: List[int]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    series: 1D np.array (scaled volatility)
+    end_indices: indices t where sequence ends at t (inclusive)
+    For each t, X = series[t-seq_len+1 : t+1], y_h = series[t+h]
+    """
+    X, Y = [], []
+    max_h = max(horizons)
+    for t in end_indices:
+        x_start = t - seq_len + 1
+        if x_start < 0 or t + max_h >= len(series):
+            continue
+        X.append(series[x_start:t+1])
+        Y.append([series[t + h] for h in horizons])
+    X = np.array(X).reshape(-1, seq_len, 1)
+    Y = np.array(Y).reshape(-1, len(horizons))
+    return X, Y
+
+# ---------------------------
+# ---------------------------
+def build_lstm_model(input_len: int, outputs: int, lr: float) -> tf.keras.Model:
+    model = Sequential([
+        LSTM(64, input_shape=(input_len, 1), return_sequences=False),
+        Dropout(0.2),
+        Dense(64, activation="relu"),
+        Dense(outputs, activation="linear")
+    ])
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+                  loss="mse")
+    return model
+
+
+def rolling_lstm_forecast(vol: pd.Series, cfg: Config) -> Dict[str, float]:
+    """
+    vol: realized volatility series (float), indexed by date, no NaNs.
+    Returns RMSE per horizon in original scale.
+    """
+    values = vol.values.astype(float)
+    dates = vol.index
+
+    max_h = max(cfg.horizons)
+    # Start from the first index where we have enough history for seq_len and training window,
+    # and enough future to evaluate horizons.
+    start_idx = cfg.seq_len - 1 + cfg.train_window
+    end_idx = len(values) - max_h - 1
+    if end_idx <= start_idx:
+        raise ValueError("Not enough data for the chosen seq_len/train_window/horizons.")
+
+    # Accumulators for predictions and truths
+    preds = {h: [] for h in cfg.horizons}
+    trues = {h: [] for h in cfg.horizons}
+    pred_dates = []  # date of forecast origin
+
+    model = None
+    last_trained_at = -np.inf
+
+    for s in range(start_idx, end_idx + 1):
+        # Training window end is s-1. Ensure targets for training stay within [0, s]
+        train_end = s - 1
+        train_start = train_end - cfg.train_window + 1
+
+        if train_start - (cfg.seq_len - 1) < 0:
+            # not enough history to form sequences
+            continue
+
+        # Fit scaler on training segment ONLY (avoid leakage)
+        scaler = StandardScaler()
+        train_slice_for_scaler = values[train_start - (cfg.seq_len - 1): train_end + 1]
+        scaler.fit(train_slice_for_scaler.reshape(-1, 1))
+
+        # Build training supervised data (scaled)
+        series_scaled = scaler.transform(values.reshape(-1, 1)).ravel()
+        # eligible training ends must allow targets inside [0, train_end]
+        train_ends = np.arange(train_start, train_end + 1, dtype=int)
+        train_ends = train_ends[train_ends + max_h <= train_end]
+
+        X_train, y_train = make_sequences(series_scaled, train_ends, cfg.seq_len, cfg.horizons)
+
+        # Build test sample at origin s (sequence ends at s)
+        X_test, y_test = make_sequences(series_scaled, np.array([s], dtype=int), cfg.seq_len, cfg.horizons)
+        if len(X_train) == 0 or len(X_test) == 0:
+            continue
+
+        # Retrain every cfg.retrain_every steps (or at first iteration)
+        if (model is None) or ((s - last_trained_at) >= cfg.retrain_every):
+            model = build_lstm_model(cfg.seq_len, len(cfg.horizons), cfg.lr)
+            es = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
+            model.fit(
+                X_train, y_train,
+                epochs=cfg.epochs,
+                batch_size=cfg.batch_size,
+                validation_split=cfg.val_split,
+                verbose=cfg.verbose_fit,
+                callbacks=[es]
+            )
+            last_trained_at = s
+
+        # Predict (scaled), then inverse-transform each horizon back to original scale
+        y_pred_scaled = model.predict(X_test, verbose=0).reshape(-1)
+        # inverse-transform per horizon
+        def inv_transform(vec_1d):
+            return scaler.inverse_transform(vec_1d.reshape(-1, 1)).ravel()
+
+        y_pred = inv_transform(y_pred_scaled)
+        y_true = inv_transform(y_test.reshape(-1))
+
+        for j, h in enumerate(cfg.horizons):
+            preds[h].append(y_pred[j])
+            trues[h].append(y_true[j])
+        pred_dates.append(dates[s])
+
+
+    rmse = {}
+    for h in cfg.horizons:
+        p = np.array(preds[h], dtype=float)
+        t = np.array(trues[h], dtype=float)
+        rmse[h] = float(np.sqrt(np.mean((p - t) ** 2)))
+
+    return {
+        "rmse_h1": rmse[1],
+        "rmse_h5": rmse[5],
+        "rmse_h20": rmse[20],
+        "rmse_h60": rmse[60],
+        "n_forecasts": len(pred_dates),
+        "first_forecast_date": str(pred_dates[0]) if pred_dates else None,
+        "last_forecast_date": str(pred_dates[-1]) if pred_dates else None,
+    }
+
+
+if __name__ == "__main__":
+    # 1) Load prices
+    price = load_price_series(CFG)
+
+    # 2) Compute realized volatility
+    vol = compute_realized_vol(price, rv_window=CFG.rv_window, annualize=CFG.annualize).dropna()
+
+    # 3) Run rolling LSTM forecast and RMSE
+    results = rolling_lstm_forecast(vol, CFG)
+
+    # 4) Report
+    print("Rolling LSTM RMSEs (volatility units):")
+    print(f"h=1:  {results['rmse_h1']:.6f}")
+    print(f"h=5:  {results['rmse_h5']:.6f}")
+    print(f"h=20: {results['rmse_h20']:.6f}")
+    print(f"h=60: {results['rmse_h60']:.6f}")
+    print(f"n_forecasts: {results['n_forecasts']}")
+    print(f"first_forecast_date: {results['first_forecast_date']}")
+    print(f"last_forecast_date:  {results['last_forecast_date']}")
